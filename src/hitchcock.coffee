@@ -6,16 +6,15 @@ httpProxy = require 'http-proxy'
 colors    = require 'colors'
 mysql     = require 'mysql'
 moment    = require 'moment'
+url       = require 'url'
 
 module.exports = class Hitchcock extends EventEmitter 
   constructor: (opts={}) ->
-    console.log 'init'
-
     @realm = opts.realm || 'TOUT'
 
     @resourceOwnerMapper = opts.resourceOwnerMapper || {
       table: 'users',
-      fields: ['id', 'uid']
+      fields: ['uid']
     }
 
     @dbConfig = opts.mysql || {
@@ -29,6 +28,9 @@ module.exports = class Hitchcock extends EventEmitter
       '': '127.0.0.1:3000'
     }
 
+    @port = opts.port || 9000
+
+    # httpProxy.ProxyTable.prototype.getProxyLocation.toString()
     @proxy = new httpProxy.RoutingProxy {
       enable: {
         xforward: true
@@ -37,21 +39,45 @@ module.exports = class Hitchcock extends EventEmitter
       router: @routerConfig 
     }
 
+    # monkeypatching http-proxy; similar to
+    # https://github.com/Zariel/node-http-proxy/blob/001f7508eadb7f6af2c7268ebe84f5c0732495e1/lib/node-http-proxy/proxy-table.js
+    @proxy.proxyTable.getProxyLocation = (req)->
+      return null if (!req or !req.headers or !req.headers.host)
+
+      target = req.url
+      for route in this.routes
+        if target.match(route.source.regexp)
+          req.url = url.format(target)
+
+          return {
+            protocol: route.target.url.protocol.replace(':', ''),
+            host: route.target.url.hostname,
+            port: route.target.url.port || (this.target.https ? 443 : 80)
+          }
+
+      return null
+
     @server = http.createServer (request, response) =>
       buffer = httpProxy.buffer request
       handleRequest {req: request, res: response}, {dbpool: @dbpool, realm: @realm, resourceOwnerMapper: @resourceOwnerMapper}, (err, result) =>
         if !err and result
           @proxy.proxyRequest request, response, {buffer: buffer}
+          # FIXME remove headers
         else
           response.writeHead 401, {"Content-Type": "application/json"}
           response.write JSON.stringify {error: 'unauthorized'}
           response.end()
 
-  handleRequest = (data, opts={},next) =>
-    parsedReq = require('url').parse data.req.url, true
-    token = parsedReq.query.access_token
+  handleRequest = (data, opts={}, next) =>
+    # {"Authorization"=>"Bearer abcd"
+    token = if data.req.headers.authorization
+      data.req.headers.authorization.split(' ').reverse()[0]
+    else
+      url.parse(data.req.url, true).query.access_token
 
     console.log ['Proxy for', data.req.url, token].join(' ').yellow
+
+    return next 'no_token_present' unless token?
   
     queryVerifyToken = (conn, token, cb) ->
       console.log err if err?
@@ -72,7 +98,7 @@ module.exports = class Hitchcock extends EventEmitter
 
     queryResourceOwner = (conn, token, cb) ->
       table = opts.resourceOwnerMapper.table
-      sql = "SELECT #{opts.resourceOwnerMapper.fields.join(', ')} FROM `#{table}` WHERE `#{table}`.`id` = '#{token.resource_owner_id}' LIMIT 1"
+      sql = "SELECT #{['id'].concat(opts.resourceOwnerMapper.fields).join(', ')} FROM `#{table}` WHERE `#{table}`.`id` = '#{token.resource_owner_id}' LIMIT 1"
       conn.query sql, (err, user) ->
         if err? or user.length isnt 1
           return cb and cb 'resource_owner_not_found'
@@ -91,19 +117,17 @@ module.exports = class Hitchcock extends EventEmitter
           return next and next true, null
 
         queryResourceOwner conn, token, (err, resourceOwner) ->
-          # console.log [err, resourceOwner]
           conn.end()
 
-          return next and next true, null if err or !resourceOwner
+          # WAS return next and next true, null if err or !resourceOwner
+          resourceOwner or= {}
 
-          data.res.setHeader "X-HITCHCOCK-#{opts.realm}-APPLICATION-ID", token.application_id
           data.res.setHeader "X-HITCHCOCK-#{opts.realm}-SCOPES", token.scopes            
           for field in opts.resourceOwnerMapper.fields
-            data.res.setHeader "X-HITCHCOCK-#{opts.realm}-RESOURCE-OWNER-#{field}", resourceOwner[field]
+            data.res.setHeader "X-HITCHCOCK-#{opts.realm}-RESOURCE-OWNER-#{field.toUpperCase()}", resourceOwner[field]
 
           next null, true
 
   start: ->
-    console.log 'starting...'
-    @server.listen 9000, '0.0.0.0'
+    @server.listen @port, '0.0.0.0'
     @.emit 'started'

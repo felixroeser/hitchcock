@@ -31,6 +31,7 @@
     "docco": "*",
     "coffee-script": ">= 1.6"
   },
-  "keywords": []
+  "keywords": [],
+  "license": "MIT"
 
 }
